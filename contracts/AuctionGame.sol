@@ -1,72 +1,210 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract DutchAuctionSwap {
-    address public seller;
-    IERC20 public token;
-    uint256 public initialPrice;
-    uint256 public startTime;
-    uint256 public duration;
-    uint256 public priceDecreaseRate;
-    uint256 public tokensForSale;
-    bool public auctionEnded;
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-    event AuctionStarted(
-        address seller,
-        uint256 initialPrice,
-        uint256 duration,
-        uint256 priceDecreaseRate
-    );
-    event TokenPurchased(address buyer, uint256 amount, uint256 price);
-
-    constructor(address _token) {
-        token = IERC20(_token);
+contract DutchAuctionSwap is Ownable {
+    struct Auction {
+        address seller;
+        address tokenAddress;
+        uint256 tokenAmount;
+        uint256 initialPrice;
+        uint256 priceDecreaseRate;
+        uint256 startTime;
+        uint256 endTime;
+        bool isActive;
+        bool isSold;
     }
 
-    function startAuction(
-        uint256 _tokensForSale,
+    mapping(uint256 => Auction) public auctions;
+    uint256 public nextAuctionId;
+
+    event AuctionCreated(
+        uint256 indexed auctionId,
+        address indexed seller,
+        address tokenAddress,
+        uint256 tokenAmount,
+        uint256 initialPrice,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    event AuctionExecuted(
+        uint256 indexed auctionId,
+        address indexed buyer,
+        uint256 finalPrice
+    );
+
+    event AuctionCancelled(uint256 indexed auctionId);
+
+    error Unauthorized();
+    error InvalidAmount();
+    error InvalidPrice();
+    error InvalidDuration();
+    error InvalidRate();
+    error InActiveAuction();
+    error AlreadySold();
+    error AuctionEnded();
+
+    constructor() Ownable(msg.sender) {
+        nextAuctionId = 1;
+    }
+
+    function createAuction(
+        address _tokenAddress,
+        uint256 _tokenAmount,
         uint256 _initialPrice,
-        uint256 _duration
-    ) external {
-        require(!auctionEnded, "Auction already ended");
+        uint256 _durationInSeconds,
+        uint256 _priceDecreaseRate
+    ) external returns (uint256) {
+        if (_tokenAddress == address(0)) revert Unauthorized();
+        if (_tokenAmount <= 0) revert InvalidAmount();
+        if (_initialPrice <= 0) revert InvalidPrice();
+        if (_durationInSeconds <= 0) revert InvalidDuration();
+        if (_priceDecreaseRate <= 0) revert InvalidRate();
+
+        uint256 totalPriceDecrease = _durationInSeconds * _priceDecreaseRate;
         require(
-            token.transferFrom(msg.sender, address(this), _tokensForSale),
+            totalPriceDecrease < _initialPrice,
+            "Price would decrease below zero"
+        );
+
+        IERC20 token = IERC20(_tokenAddress);
+        require(
+            token.transferFrom(msg.sender, address(this), _tokenAmount),
             "Token transfer failed"
         );
 
-        seller = msg.sender;
-        tokensForSale = _tokensForSale;
-        initialPrice = _initialPrice;
-        duration = _duration;
-        startTime = block.timestamp;
-        priceDecreaseRate = _initialPrice / _duration;
-        auctionEnded = false;
+        uint256 auctionId = nextAuctionId;
+        nextAuctionId++;
 
-        emit AuctionStarted(seller, initialPrice, duration, priceDecreaseRate);
+        uint256 startTime = block.timestamp;
+        uint256 endTime = startTime + _durationInSeconds;
+
+        auctions[auctionId] = Auction({
+            seller: msg.sender,
+            tokenAddress: _tokenAddress,
+            tokenAmount: _tokenAmount,
+            initialPrice: _initialPrice,
+            priceDecreaseRate: _priceDecreaseRate,
+            startTime: startTime,
+            endTime: endTime,
+            isActive: true,
+            isSold: false
+        });
+
+        emit AuctionCreated(
+            auctionId,
+            msg.sender,
+            _tokenAddress,
+            _tokenAmount,
+            _initialPrice,
+            startTime,
+            endTime
+        );
+
+        return auctionId;
     }
 
-    function getCurrentPrice() public view returns (uint256) {
-        uint256 elapsedTime = block.timestamp - startTime;
-        if (elapsedTime >= duration) {
+    function getCurrentPrice(uint256 _auctionId) public view returns (uint256) {
+        Auction storage auction = auctions[_auctionId];
+        if (auction.isActive != true) revert InActiveAuction();
+
+        if (block.timestamp >= auction.endTime) {
+            return
+                auction.initialPrice -
+                (auction.priceDecreaseRate *
+                    (auction.endTime - auction.startTime)); //not certain of the calculaution
+        }
+
+        uint256 timeElapsed = block.timestamp - auction.startTime;
+        uint256 priceDecrease = timeElapsed * auction.priceDecreaseRate;
+
+        if (priceDecrease >= auction.initialPrice) {
             return 0;
         }
-        return initialPrice - (elapsedTime * priceDecreaseRate);
+
+        return auction.initialPrice - priceDecrease;
     }
 
-    function buyTokens() external payable {
-        require(!auctionEnded, "Auction has ended");
-        uint256 currentPrice = getCurrentPrice();
+    function executeSwap(uint256 _auctionId) external payable {
+        Auction storage auction = auctions[_auctionId];
+        if (auction.isActive != true) revert InActiveAuction();
+        if (auction.isSold != false) revert AlreadySold();
+        if (block.timestamp >= auction.endTime) revert AuctionEnded();
+
+        uint256 currentPrice = getCurrentPrice(_auctionId);
         require(msg.value >= currentPrice, "Insufficient payment");
 
-        auctionEnded = true;
+        auction.isActive = false;
+        auction.isSold = true;
+
+        IERC20 token = IERC20(auction.tokenAddress);
         require(
-            token.transfer(msg.sender, tokensForSale),
+            token.transfer(msg.sender, auction.tokenAmount),
             "Token transfer failed"
         );
-        payable(seller).transfer(msg.value);
 
-        emit TokenPurchased(msg.sender, tokensForSale, currentPrice);
+        (bool sent, ) = auction.seller.call{value: currentPrice}("");
+        require(sent, "Failed to send ETH to seller");
+
+        uint256 excess = msg.value - currentPrice;
+        if (excess > 0) {
+            (bool refunded, ) = msg.sender.call{value: excess}("");
+            require(refunded, "Failed to refund excess");
+        }
+
+        emit AuctionExecuted(_auctionId, msg.sender, currentPrice);
+    }
+
+    function cancelAuction(uint256 _auctionId) external {
+        Auction storage auction = auctions[_auctionId];
+
+        if (auction.seller != msg.sender) revert Unauthorized();
+        if (auction.isActive != true) revert InActiveAuction();
+        if (auction.isSold != false) revert AlreadySold();
+
+        auction.isActive = false;
+
+        IERC20 token = IERC20(auction.tokenAddress);
+        require(
+            token.transfer(auction.seller, auction.tokenAmount),
+            "Token transfer failed"
+        );
+
+        emit AuctionCancelled(_auctionId);
+    }
+
+    function getAuctionInfo(
+        uint256 _auctionId
+    )
+        external
+        view
+        returns (
+            address seller,
+            address tokenAddress,
+            uint256 tokenAmount,
+            uint256 initialPrice,
+            uint256 currentPrice,
+            uint256 startTime,
+            uint256 endTime,
+            bool isActive,
+            bool isSold
+        )
+    {
+        Auction storage auction = auctions[_auctionId];
+        return (
+            auction.seller,
+            auction.tokenAddress,
+            auction.tokenAmount,
+            auction.initialPrice,
+            getCurrentPrice(_auctionId),
+            auction.startTime,
+            auction.endTime,
+            auction.isActive,
+            auction.isSold
+        );
     }
 }

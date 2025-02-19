@@ -1,40 +1,66 @@
-// Hardhat Test (test/auction.js)
-const { expect } = require("chai");
-const { ethers } = require("hardhat");
+import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+import { ethers } from "hardhat";
+import { expect } from "chai";
 
-describe("Reverse Dutch Auction Swap", function () {
-    // let auction, token, owner, buyer;
-    describe("SAVE_ERC20", () => {
-        async function deploySaveFixture() {
-            const [owner, addr1, addr2] = await ethers.getSigners()
+describe("ReverseDutchAuctionSwap", () => {
+    async function deployAuctionFixture() {
+        const [owner, buyer] = await ethers.getSigners();
+        const Token = await ethers.getContractFactory("MAINERC20");
+        const token = await Token.deploy(owner.address, ethers.parseUnits("1000", 18));
+        await token.waitForDeployment();
 
-            [owner, buyer] = await ethers.getSigners();
-            const Token = await ethers.getContractFactory("DutchAuctionSwap");
-            token = await Token.deploy("EBUKA", "EBU", owner.address, ethers.utils.parseEther("1000"));
-            await token.deployed();
+        const Auction = await ethers.getContractFactory("DutchAuctionSwap");
+        const auction = await Auction.deploy(Token.target);
+        await auction.waitForDeployment();
 
-            const Auction = await ethers.getContractFactory("DutchAuctionSwap");
-            auction = await Auction.deploy();
-            await auction.deployed();
+        return { owner, buyer, token, auction };
+    }
+
+    describe("Deployment", () => {
+        it("Should set the seller correctly", async () => {
+            const { owner, auction } = await loadFixture(deployAuctionFixture);
+            expect(await auction.seller()).to.equal(owner.address);
         });
-
-    it("Should allow seller to start an auction", async function () {
-        await token.approve(auction.address, ethers.utils.parseEther("100"));
-        await auction.startAuction(token.address, ethers.utils.parseEther("100"), ethers.utils.parseEther("10"), 3600);
-        expect(await auction.auctionActive()).to.be.true;
     });
 
-    it("Should allow a buyer to purchase at a reduced price", async function () {
-        await token.approve(auction.address, ethers.utils.parseEther("100"));
-        await auction.startAuction(token.address, ethers.utils.parseEther("100"), ethers.utils.parseEther("10"), 3600);
+    describe("Start Auction", () => {
+        it("Should allow seller to start an auction", async () => {
+            const { owner, token, auction } = await loadFixture(deployAuctionFixture);
+            const amount = ethers.parseUnits("100", 18);
+            await token.approve(auction.target, amount);
+            await expect(auction.startAuction(token.target, amount, ethers.parseUnits("10", 18), 3600))
+                .to.not.be.reverted;
+        });
+    });
 
-        await network.provider.send("evm_increaseTime", [1800]);
-        await network.provider.send("evm_mine");
+    describe("Get Current Price", () => {
+        it("Should return the correct price after time passes", async () => {
+            const { owner, token, auction } = await loadFixture(deployAuctionFixture);
+            const amount = ethers.parseUnits("100", 18);
+            await token.approve(auction.target, amount);
+            await auction.startAuction(token.target, amount, ethers.parseUnits("10", 18), 3600);
 
-        const price = await auction.getCurrentPrice();
-        await auction.connect(buyer).buy({ value: price });
+            await network.provider.send("evm_increaseTime", [1800]);
+            await network.provider.send("evm_mine");
 
-        expect(await token.balanceOf(buyer.address)).to.equal(ethers.utils.parseEther("100"));
-        expect(await auction.auctionActive()).to.be.false;
+            const currentPrice = await auction.getCurrentPrice();
+            expect(currentPrice).to.be.below(ethers.parseUnits("10", 18));
+        });
+    });
+
+    describe("Buy", () => {
+        it("Should allow a buyer to purchase at the current price", async () => {
+            const { owner, buyer, token, auction } = await loadFixture(deployAuctionFixture);
+            const amount = ethers.parseUnits("100", 18);
+            await token.approve(auction.target, amount);
+            await auction.startAuction(token.target, amount, ethers.parseUnits("10", 18), 3600);
+
+            await network.provider.send("evm_increaseTime", [1800]);
+            await network.provider.send("evm_mine");
+
+            const price = await auction.getCurrentPrice();
+            await expect(auction.connect(buyer).buy({ value: price })).to.not.be.reverted;
+            expect(await auction.auctionActive()).to.be.false;
+        });
     });
 });
